@@ -1,0 +1,26 @@
+# PDF 转 Markdown 依赖库
+
+# 核心依赖
+pdf2image>=1.16.0
+Pillow>=10.0.0
+PyYAML>=6.0
+
+# PaddleOCR 相关
+paddleocr[doc-parser]>=2.7.0
+
+# PaddlePaddle (需要从官方源安装)
+# GPU 版本 (CUDA 12.6):
+#   uv pip install paddlepaddle-gpu==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+# GPU 版本 (CUDA 11.8):
+#   uv pip install paddlepaddle-gpu==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+# CPU 版本:
+#   uv pip install paddlepaddle==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+
+# LLM API 支持
+openai>=1.0.0
+anthropic>=0.18.0
+
+# 可选: 系统依赖
+# Ubuntu/Debian: sudo apt-get install poppler-utils
+# macOS: brew install poppler
+# Windows: 下载 poppler 并添加到 PATH

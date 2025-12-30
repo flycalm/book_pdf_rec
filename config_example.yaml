@@ -1,0 +1,45 @@
+# PDF 转 Markdown 配置文件
+
+# PDF 处理配置
+pdf:
+  dpi: 150  # PDF 转图像的分辨率（150-300 推荐，更高更清晰但更慢）
+  page_range: [1,2]  # 页面范围 [起始页, 结束页]，如 [1, 20]。null 表示转换全部页面
+
+# OCR 配置
+ocr:
+  use_gpu: true  # 是否使用 GPU 加速
+
+# LLM 配置
+llm:
+  enabled: true  # 是否启用 LLM 优化
+  provider: openai  # LLM 提供商: openai, claude, local
+  
+  # DeepSeek 配置（兼容 OpenAI API 格式）
+  # api_key: ""  # 你的 DeepSeek API Key
+  # api_base: "https://api.deepseek.com"  # DeepSeek API Base URL
+  # model: deepseek-chat  # DeepSeek 模型名称
+  
+  # mimo配置
+  # OpenRouter 配置（兼容 OpenAI API 格式）
+  api_key: ""  # 你的 OpenRouter API Key
+  api_base: "https://openrouter.ai/api/v1"  # OpenRouter API Base URL（不要加 /chat/completions）
+  model: xiaomi/mimo-v2-flash:free  # 模型名称
+  # Claude 配置示例
+  # provider: claude
+  # api_key: "sk-ant-xxx"
+  # model: claude-3-sonnet-20240229
+  
+  # 本地 LLM 配置示例 (如 Ollama)
+  # provider: local
+  # api_base: "http://localhost:11434/v1"
+  # model: llama2
+  
+  # 文本处理参数
+  chunk_size: 2000  # 每个文本块的大小
+  chunk_overlap: 200  # 文本块之间的重叠大小
+  max_workers: 5  # 并行处理的最大线程数（1 为串行，建议 3-10）
+
+# 输出配置
+output:
+  save_intermediate: true  # 是否保存中间文件（图像、原始 OCR 结果等）
+  output_dir: output  # 输出目录
