@@ -20,6 +20,10 @@ paddleocr[doc-parser]>=2.7.0
 openai>=1.0.0
 anthropic>=0.18.0
 
+# Markdown 到 EPUB 转换
+ebooklib>=0.18
+markdown>=3.5.0
+
 # 可选: 系统依赖
 # Ubuntu/Debian: sudo apt-get install poppler-utils
 # macOS: brew install poppler
