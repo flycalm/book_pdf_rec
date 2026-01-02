@@ -4,6 +4,7 @@
 pdf:
   dpi: 150  # PDF 转图像的分辨率（150-300 推荐，更高更清晰但更慢）
   page_range: [1,2]  # 页面范围 [起始页, 结束页]，如 [1, 20]。null 表示转换全部页面
+  batch_size: 20  # 每批处理的页数（内存优化：避免一次性加载所有页面）
 
 # OCR 配置
 ocr:
@@ -37,7 +38,11 @@ llm:
   # 文本处理参数
   chunk_size: 2000  # 每个文本块的大小
   chunk_overlap: 200  # 文本块之间的重叠大小
-  max_workers: 5  # 并行处理的最大线程数（1 为串行，建议 3-10）
+  max_workers: 5  # 并行处理的最大线程数（免费API建议设为1，付费API可设3-10）
+  batch_size: 10  # LLM处理时每批处理的页数（内存优化：避免一次性加载所有页面）
+  retry_times: 3  # API调用失败后的重试次数
+  retry_delay: 2  # 重试延迟（秒）
+  request_interval: 0.5  # 请求间隔（秒），免费API建议1-2秒，付费API可设0.1-0.5
 
 # 输出配置
 output:

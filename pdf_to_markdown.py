@@ -12,6 +12,7 @@ from typing import List, Dict, Optional, Tuple
 import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 try:
     from pdf2image import convert_from_path
@@ -184,6 +185,54 @@ class PDFToMarkdownConverter:
         
         return markdown_pages
     
+    def ocr_images_streaming(self, images: List[Image.Image], output_dir: str, page_offset: int = 0):
+        """流式 OCR 识别:逐页处理并立即写入临时文件,释放内存"""
+        self.initialize_ocr()
+        
+        total = len(images)
+        
+        for idx, image in enumerate(images, 1):
+            actual_page_num = page_offset + idx
+            print(f"正在处理第 {actual_page_num}/{page_offset + total} 页...")
+            
+            # 保存临时图像
+            temp_img_path = os.path.join(output_dir, f"temp_page_{actual_page_num}.png")
+            image.save(temp_img_path)
+            
+            # OCR 识别
+            try:
+                output = self.ocr_pipeline.predict(temp_img_path)
+                
+                # 提取 Markdown 内容
+                page_markdown = ""
+                for res in output:
+                    # 保存为临时 Markdown
+                    temp_md_path = os.path.join(output_dir, f"page_{actual_page_num}_raw.md")
+                    res.save_to_markdown(save_path=output_dir)
+                    
+                    # 读取生成的 Markdown
+                    md_files = sorted([f for f in os.listdir(output_dir) if f.endswith('.md')])
+                    if md_files:
+                        latest_md = os.path.join(output_dir, md_files[-1])
+                        with open(latest_md, 'r', encoding='utf-8') as f:
+                            page_markdown = f.read()
+                        # 重命名为标准名称
+                        os.rename(latest_md, temp_md_path)
+                
+                # 立即写入临时文件,不保存在内存中
+                yield actual_page_num, page_markdown
+                
+                # 清理临时图像
+                if not self.config['output']['save_intermediate']:
+                    os.remove(temp_img_path)
+                    
+            except Exception as e:
+                print(f"处理第 {actual_page_num} 页时出错: {e}")
+                yield actual_page_num, f"# 页面 {actual_page_num} 处理失败\n\n{str(e)}\n\n"
+            
+            # 释放图像内存
+            del image
+    
     def _smart_merge_pages(self, pages: List[str]) -> str:
         """
         智能合并页面，处理跨页文本
@@ -246,8 +295,21 @@ class PDFToMarkdownConverter:
                         end = last_sep + len(separator)
                         break
             
+            # 防止 end 没有推进导致死循环
+            if end <= start:
+                end = min(start + chunk_size, len(text))
+                if end <= start:
+                    break
+            
             chunks.append(text[start:end])
-            start = end - overlap if end < len(text) else end
+            if end < len(text):
+                next_start = end - overlap
+                # 若重叠导致不前进，禁用本次重叠
+                if next_start <= start:
+                    next_start = end
+                start = max(0, next_start)
+            else:
+                start = end
         
         return chunks
     
@@ -295,12 +357,17 @@ class PDFToMarkdownConverter:
         # 存储结果，保持顺序
         results = [None] * total
         
+        # 获取请求间隔配置（用于免费API限流）
+        request_interval = self.config['llm'].get('request_interval', 0.5)  # 默认每个请求间隔0.5秒
+        
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # 提交所有任务
-            future_to_index = {
-                executor.submit(self._call_llm_safe, chunk, idx): idx 
-                for idx, chunk in enumerate(chunks)
-            }
+            # 提交所有任务，添加延迟避免同时请求
+            future_to_index = {}
+            for idx, chunk in enumerate(chunks):
+                if idx > 0 and request_interval > 0:
+                    time.sleep(request_interval)  # 提交任务之间的延迟
+                future = executor.submit(self._call_llm_safe, chunk, idx)
+                future_to_index[future] = idx
             
             # 处理完成的任务
             completed = 0
@@ -318,12 +385,27 @@ class PDFToMarkdownConverter:
         return '\n\n'.join(results)
     
     def _call_llm_safe(self, chunk: str, idx: int) -> str:
-        """安全地调用 LLM（带异常处理）"""
-        try:
-            return self._call_llm(chunk)
-        except Exception as e:
-            print(f"  块 {idx+1} LLM 调用异常: {e}")
-            return chunk
+        """安全地调用 LLM（带异常处理和重试）"""
+        retry_times = self.config['llm'].get('retry_times', 3)
+        retry_delay = self.config['llm'].get('retry_delay', 2)
+        
+        for attempt in range(retry_times):
+            try:
+                return self._call_llm(chunk)
+            except Exception as e:
+                error_msg = str(e)
+                if attempt < retry_times - 1:
+                    # 检查是否是速率限制错误
+                    if '429' in error_msg or 'rate' in error_msg.lower():
+                        wait_time = retry_delay * (attempt + 1)  # 指数退避
+                        print(f"  块 {idx+1} 遇到速率限制，等待 {wait_time} 秒后重试...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"  块 {idx+1} LLM 调用失败（尝试 {attempt+1}/{retry_times}），重试中...")
+                        time.sleep(retry_delay)
+                else:
+                    print(f"  块 {idx+1} LLM 调用异常（已重试{retry_times}次）: {e}")
+                    return chunk  # 返回原文
     
     def _call_llm(self, text: str) -> str:
         """调用 LLM API"""
@@ -438,6 +520,82 @@ class PDFToMarkdownConverter:
         
         return text
     
+    def process_pages_with_llm_streaming(self, work_dir: str, total_pages: int, output_file: str):
+        """流式处理:分批读取页面,LLM 处理后立即写入输出文件"""
+        if not self.config['llm']['enabled']:
+            # 如果不使用 LLM,直接合并所有页面
+            self._merge_pages_to_file(work_dir, total_pages, output_file)
+            return
+        
+        print("正在使用 LLM 流式优化文本...")
+        self.initialize_llm()
+        
+        if not self.llm_client:
+            print("警告: LLM 客户端初始化失败,将直接合并页面")
+            self._merge_pages_to_file(work_dir, total_pages, output_file)
+            return
+        
+        batch_size = self.config['llm'].get('batch_size', 10)  # 每批处理的页数
+        
+        with open(output_file, 'a', encoding='utf-8') as out_f:
+            for batch_start in range(1, total_pages + 1, batch_size):
+                batch_end = min(batch_start + batch_size - 1, total_pages)
+                print(f"处理页面 {batch_start}-{batch_end}/{total_pages}...")
+                
+                # 读取一批页面
+                batch_pages = []
+                for page_num in range(batch_start, batch_end + 1):
+                    page_file = os.path.join(work_dir, f"page_{page_num}_raw.md")
+                    if os.path.exists(page_file):
+                        with open(page_file, 'r', encoding='utf-8') as f:
+                            batch_pages.append(f.read())
+                    else:
+                        batch_pages.append(f"# 页面 {page_num} 缺失\n\n")
+                
+                # 合并这批页面
+                batch_text = self._smart_merge_pages(batch_pages)
+                
+                # LLM 处理
+                processed_text = self.process_with_llm(batch_text)
+                
+                # 立即写入输出文件
+                out_f.write(processed_text)
+                out_f.write('\n\n')  # 批次之间的分隔
+                out_f.flush()  # 强制写入磁盘
+                
+                # 释放内存
+                del batch_pages
+                del batch_text
+                del processed_text
+    
+    def _merge_pages_to_file(self, work_dir: str, total_pages: int, output_file: str):
+        """直接合并所有页面到输出文件(不使用 LLM)"""
+        print("正在合并所有页面...")
+        
+        with open(output_file, 'a', encoding='utf-8') as out_f:
+            prev_page = ""
+            for page_num in range(1, total_pages + 1):
+                page_file = os.path.join(work_dir, f"page_{page_num}_raw.md")
+                if os.path.exists(page_file):
+                    with open(page_file, 'r', encoding='utf-8') as f:
+                        current_page = f.read().strip()
+                    
+                    if not current_page:
+                        continue
+                    
+                    # 智能连接页面
+                    if prev_page:
+                        sentence_endings = ('。', '!', '?', '.', '!', '?', '\n', ')', ')', '"', '"', '」', '》')
+                        if prev_page[-1] not in sentence_endings:
+                            out_f.write(current_page)
+                        else:
+                            out_f.write('\n\n' + current_page)
+                    else:
+                        out_f.write(current_page)
+                    
+                    prev_page = current_page
+                    out_f.flush()
+    
     def convert(self, pdf_path: str, output_path: Optional[str] = None, 
                 page_range: Optional[Tuple[int, int]] = None) -> str:
         """
@@ -466,44 +624,82 @@ class PDFToMarkdownConverter:
             output_path = os.path.join(output_dir, f"{pdf_name}.md")
         
         try:
-            # 步骤 1: PDF 转图像
-            images = self.pdf_to_images(pdf_path, page_range)
+            # 步骤 1: 确定总页数
+            print(f"正在分析 PDF: {pdf_path}")
+            dpi = self.config.get('pdf', {}).get('dpi', 300)
+            config_range = self.config.get('pdf', {}).get('page_range')
+            if page_range is None and config_range and len(config_range) == 2:
+                page_range = tuple(config_range)
             
-            # 步骤 2: OCR 识别
-            markdown_pages = self.ocr_images(images, work_dir)
+            # 先获取总页数(不加载图像内容)
+            from pdf2image import pdfinfo_from_path
+            pdf_info = pdfinfo_from_path(pdf_path)
+            total_pages = pdf_info.get('Pages', 0)
             
-            # 步骤 3: 合并所有页面
-            print("正在合并所有页面...")
-            # 智能合并：如果上一页末尾没有标点符号，直接连接；否则换行
-            full_text = self._smart_merge_pages(markdown_pages)
+            if page_range:
+                first_page, last_page = page_range
+                total_pages = last_page - first_page + 1
+                page_offset = first_page - 1
+            else:
+                first_page = 1
+                last_page = total_pages
+                page_offset = 0
             
-            # 步骤 4: LLM 优化（可选）
-            if self.config['llm']['enabled']:
-                print("正在使用 LLM 优化文本...")
-                self.initialize_llm()
-                full_text = self.process_with_llm(full_text)
+            print(f"总页数: {total_pages},处理范围: {first_page}-{last_page}")
             
-            # 步骤 5: 保存最终结果
-            print(f"正在保存到 {output_path}...")
+            # 写入文件头部
             with open(output_path, 'w', encoding='utf-8') as f:
-                # 添加文档头部信息
                 header = f"""# {Path(pdf_path).stem}
 
 > 转换时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 > 原文件: {pdf_path}
-> 页数: {len(images)}
+> 页数: {total_pages}
 
 ---
 
 """
-                f.write(header + full_text)
+                f.write(header)
             
-            print(f"✓ 转换完成! 输出文件: {output_path}")
+            # 步骤 2: 流式处理 - 分批转换和 OCR
+            # 每次只处理少量页面,避免内存占用过大
+            batch_size = self.config.get('pdf', {}).get('batch_size', 20)  # 每批处理的页数
+            
+            for batch_start in range(first_page, last_page + 1, batch_size):
+                batch_end = min(batch_start + batch_size - 1, last_page)
+                print(f"\n=== 处理批次: 页面 {batch_start}-{batch_end} ===")
+                
+                # 只转换当前批次的页面
+                print(f"正在转换 PDF 页面 {batch_start}-{batch_end}...")
+                batch_images = convert_from_path(
+                    pdf_path,
+                    first_page=batch_start,
+                    last_page=batch_end,
+                    dpi=dpi
+                )
+                
+                # OCR 识别(流式,逐页处理)
+                for page_num, page_markdown in self.ocr_images_streaming(batch_images, work_dir, batch_start - 1):
+                    # 写入临时文件
+                    temp_md_path = os.path.join(work_dir, f"page_{page_num}_raw.md")
+                    with open(temp_md_path, 'w', encoding='utf-8') as f:
+                        f.write(page_markdown)
+                
+                # 释放图像内存
+                del batch_images
+                print(f"批次 {batch_start}-{batch_end} 处理完成,内存已释放")
+            
+            # 步骤 3: 流式 LLM 处理和合并
+            # 分批读取页面,处理后立即写入输出文件
+            print("\n=== 开始文本优化和合并 ===")
+            self.process_pages_with_llm_streaming(work_dir, last_page, output_path)
+            
+            print(f"\n✓ 转换完成! 输出文件: {output_path}")
             
             # 清理临时文件
             if not self.config['output']['save_intermediate']:
                 import shutil
                 shutil.rmtree(work_dir)
+                print("临时文件已清理")
             else:
                 print(f"中间文件保存在: {work_dir}")
             
